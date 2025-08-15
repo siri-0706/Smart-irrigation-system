@@ -1,0 +1,103 @@
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+
+#define MOISTURE_PIN A0
+#define RELAY_PIN    D1
+
+// --- fill these ---
+const char* WIFI_SSID     = "YOUR_WIFI";
+const char* WIFI_PASSWORD = "YOUR_PASS";
+const char* FIREBASE_API_KEY = "YOUR_FIREBASE_WEB_API_KEY";
+const char* FIREBASE_DB_URL  = "https://your-project-id-default-rtdb.firebaseio.com/";
+const char* DEVICE_ID        = "node-001";
+
+// thresholds (hysteresis)
+int ON_BELOW  = 30; // %
+int OFF_ABOVE = 45; // %
+unsigned long MIN_ON_MS  = 20 * 1000UL;
+unsigned long MIN_OFF_MS = 20 * 1000UL;
+
+// calibration
+int RAW_DRY = 800;   // set after measuring dry soil
+int RAW_WET = 300;   // set after measuring saturated soil
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+unsigned long lastPumpChange = 0;
+bool pumpOn = false;
+
+int readMoisturePercent() {
+  // median of 5 + simple moving average of 5
+  int vals[5];
+  for (int i=0;i<5;i++){ vals[i] = analogRead(MOISTURE_PIN); delay(10); }
+  // median
+  for(int i=0;i<5;i++) for(int j=i+1;j<5;j++) if(vals[j]<vals[i]) swap(vals[i], vals[j]);
+  int raw = vals[2];
+  raw = constrain(raw, RAW_WET, RAW_DRY);
+  float pct = 100.0 * (RAW_DRY - raw) / (RAW_DRY - RAW_WET);
+  return (int)pct;
+}
+
+void setPump(bool on){
+  if (on == pumpOn) return;
+  unsigned long now = millis();
+  if (on && (now - lastPumpChange < MIN_OFF_MS)) return;
+  if (!on && (now - lastPumpChange < MIN_ON_MS)) return;
+  pumpOn = on;
+  digitalWrite(RELAY_PIN, pumpOn ? LOW : HIGH); // active LOW relay
+  lastPumpChange = now;
+}
+
+void publish(int moisture){
+  // publish latest + append telemetry
+  StaticJsonDocument<256> doc;
+  doc["moisture"] = moisture;
+  doc["pumpState"] = pumpOn;
+  doc["ts"] = (int)(millis()/1000);
+
+  String base = String("/devices/") + DEVICE_ID;
+  Firebase.RTDB.setJSON(&fbdo, (base + "/latest").c_str(), &doc);
+
+  String path = base + "/telemetry";
+  Firebase.RTDB.pushJSON(&fbdo, path.c_str(), &doc);
+}
+
+void setup(){
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH);
+  Serial.begin(115200);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED){ delay(500); Serial.print("."); }
+  Serial.println("\nWiFi OK");
+
+  config.api_key = FIREBASE_API_KEY;
+  config.database_url = FIREBASE_DB_URL;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+}
+
+unsigned long lastRead=0, lastPub=0;
+void loop(){
+  if (millis() - lastRead > 2000){
+    lastRead = millis();
+    int m = readMoisturePercent();
+
+    // edge decision
+    if (m < ON_BELOW) setPump(true);
+    if (m > OFF_ABOVE) setPump(false);
+
+    // publish every 10s or on pump change
+    if (millis() - lastPub > 10000){
+      if (Firebase.ready()){
+        publish(m);
+        lastPub = millis();
+      }
+    }
+    Serial.printf("Moisture: %d%% | Pump: %s\n", m, pumpOn?"ON":"OFF");
+  }
+}
